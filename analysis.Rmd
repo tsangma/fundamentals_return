@@ -18,6 +18,10 @@ library(data.table)
 library(bonsai)
 ```
 
+This is an WIP analysis of the effects of fundamentals on returns in excess of the markets. 
+Most data processing is done through run_pipeline.py in src. Data processing is not final and is contiunually undergoing more processing. 
+
+This file provides a shell to run a lightgbm model with fundamentals as variables on the returns of equities in excess of market returns (where market returns is the returns on VTI.) The effects of each variable will be studied through SHAP values. 
 
 ## Reading in Data
 
@@ -27,7 +31,7 @@ df = read_parquet("processed_data/monthly_data.parquet")
 
 # Generating summary of outliers
 ```{r}
-columns_to_analyze <- c('pe', 'excess_close_rolling_return_1p', 'evebitda', 'grossmargin', 'ebitdamargin', 'netmargin', 'currentratio')
+columns_to_analyze <- c('pe', 'excess_close_rolling_return_1p', 'market_close_rolling_return_1p', 'evebitda', 'grossmargin', 'ebitdamargin', 'netmargin', 'currentratio')
 
 # Initialize an empty list to store the summary for each column
 results_list <- list()
@@ -91,65 +95,44 @@ outlier_summary_df <- dplyr::bind_rows(results_list)
 print(outlier_summary_df)
 ```
 
-# Building multilinear regression model 
-```{r}
-set.seed(123)
-
-lm_dataset <- df %>%
-  setDT() %>%
-  select(c('pe', 'excess_close_rolling_return_1p', 'evebitda', 'grossmargin', 'ebitdamargin', 'netmargin', 'currentratio')) %>%
-  mutate_all(function(x) ifelse(is.nan(x), NA, x)) %>%
-  drop_na()
-
-lm_folds <- lm_dataset %>% vfold_cv(v=10)
-
-lm_rec <- recipe(excess_close_rolling_return_1p ~ ., data = lm_dataset) %>%
-  step_normalize(c(all_numeric_predictors())) %>%
-  step_lag()
-  step_log(c(all_numeric_predictors()), offset = 1) %>%
-  step_impute_median(all_numeric_predictors()) 
-
-lm_mod <- linear_reg()
-
-lm_wf <-
-  workflow() %>%
-  add_model(lm_mod) %>%
-  add_recipe(lm_rec)
-
-lm_fit <- lm_wf %>% fit(lm_dataset)
-fit_parsnip <- extract_fit_parsnip(lm_fit)
-fit_parsnip$fit %>% summary()
-```
-
+# Defining LGB model.
 
 ```{r}
+lgb_columns <- c('pe', 'excess_close_rolling_return_1p', 'evebitda', 'grossmargin', 'ebitdamargin', 'netmargin', 'currentratio')
+
+# Quick final processing
 lgb_dataset <- df %>%
   setDT() %>%
-  select(c('pe', 'excess_close_rolling_return_1p', 'evebitda', 'grossmargin', 'ebitdamargin', 'netmargin', 'currentratio')) %>%
+  select(lgb_columns) %>%
   mutate_all(function(x) ifelse(is.nan(x), NA, x)) %>%
   drop_na()
 
+# Splitting data
 lgb_split <- initial_split(lgb_dataset, strata = excess_close_rolling_return_1p)
 lgb_train <- training(lgb_split)
 lgb_test <- testing(lgb_split)
+lgb_folds <- lgb_dataset %>% vfold_cv(v=10, strata = excess_close_rolling_return_1p)
 
+# Definigng model
 lgb_spec <- boost_tree(
   trees = 1000,
   tree_depth = tune(),
   min_n = tune(),
-  mtry = tune()
-  # learn_rate = tune()
+  # mtry = tune(),
+  learn_rate = tune()
 ) %>%
   set_engine("lightgbm") %>%
   set_mode("regression")
 
+# Defining recipe (currently no steps)
+lgb_rec <- recipe(excess_close_rolling_return_1p ~ ., data = lgb_dataset)
+
+# Defining hyperparameter tuning
 lgb_params <-
   dials::parameters(
-  # The parameters have sane defaults, but if you have some knowledge 
-  # of the process you can set upper and lower limits to these parameters.
-  min_n(), # 2nd important
-  tree_depth(), # 3rd most important
-  mtry()
+  min_n(),
+  tree_depth(),
+  learn_rate()
 )
 
 lgb_grid <-
@@ -158,14 +141,12 @@ lgb_grid <-
   size = 50
 )
 
-lgb_folds <- lgb_dataset %>% vfold_cv(v=10, strata = excess_close_rolling_return_1p)
-
-lgb_rec <- recipe(excess_close_rolling_return_1p ~ ., data = lgb_dataset)
 
 lgb_wf <- workflow() %>%
   add_recipe(lgb_rec) %>%
   add_model(lgb_spec)
 
+# Tune
 lgb_res <- tune_grid(
   lgb_wf,
   resamples = lgb_folds,
@@ -178,23 +159,68 @@ saveRDS(lgb_res, file = "lgb_res_saved_2.rds")
 ```
 
 ```{r}
-lgb_res <- readRDS(file = "lgb_res_saved.rds")
+lgb_res <- readRDS(file = "lgb_res_saved_2.rds")
 lgb_res %>% show_best(metric = "rmse", n=5)
-```
 
-```{r}
+# Get best hyperparameters after tuning
 lgb_best_params <-
   lgb_res %>%
   tune::select_best(metric = "rmse")
+
+# Finalize the workflow 
+final_lgb_wf <- finalize_workflow(
+  lgb_wf,
+  lgb_best_params
+)
+
+# Last fit does a final fitting from the finalized workflow, and predicts on the test data as defined by the split. 
+final_summary <- final_lgb_wf %>%
+  last_fit(split = lgb_split, metrics = metric_set(rmse, rsq, mae)) # Specify your metrics
+```
+
+# Check metrics
+```{r}
+collect_metrics(final_summary)
+```
+
+
+# Analyzing SHAP values for each vairable
+```{r}
+library(kernelshap)
+library(shapviz)
 ```
 
 ```{r}
-lgb_final <-
-  lgb_spec%>%
-  finalize_model(lgb_best_params)
+fitted_workflow_from_last_fit <- extract_workflow(final_summary)
+
+prepped_recipe_object <- extract_recipe(fitted_workflow_from_last_fit)
+
+# xvars <- c('pe', 'evebitda', 'grossmargin', 'ebitdamargin', 'netmargin', 'currentratio')
+df_explain <- lgb_train[1:1000, ]  # Use only feature columns
+
+X_pred <- bake(
+  prepped_recipe_object,
+  new_data = df_explain,
+  # Get all predictor columns. Ensure roles are set correctly in your recipe.
+  # If your recipe uses has_role("predictor"), this is good.
+  # Otherwise, you might need to be more specific or ensure all_predictors() works as expected.
+  all_predictors()
+) |>
+bonsai:::prepare_df_lgbm() # Bonsai specific step for LightGBM
+
+shap_values_lgb <- extract_fit_engine(fitted_workflow_from_last_fit) |>
+  shapviz(
+    X_pred = X_pred,
+    X = df_explain  # This is where df_explain is used
+  )
+
 ```
 
 ```{r}
-lgb_final %>% fit(X, y)
+shap_values_lgb |> 
+  sv_importance("bee")
+
+shap_values_lgb |> 
+  sv_dependence('pe')
 ```
 
