@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.DS_store
+.python-version
+*.kock
+tests/
+app.log
+pyproject.toml
+uv.lock
+testing.ipynb
+*.rds
+sharadar_data_20250531/
+processed_data/
+
+# Virtual environments
+.venv
+.Rproj.user

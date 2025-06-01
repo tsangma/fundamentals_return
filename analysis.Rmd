@@ -1,0 +1,200 @@
+---
+title: "analysis"
+output: html_document
+date: "2025-06-01"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(arrow)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(tidymodels)
+library(data.table)
+library(bonsai)
+```
+
+
+## Reading in Data
+
+```{r}
+df = read_parquet("processed_data/monthly_data.parquet")
+```
+
+# Generating summary of outliers
+```{r}
+columns_to_analyze <- c('pe', 'excess_close_rolling_return_1p', 'evebitda', 'grossmargin', 'ebitdamargin', 'netmargin', 'currentratio')
+
+# Initialize an empty list to store the summary for each column
+results_list <- list()
+total_rows_in_df <- nrow(df)
+
+# Loop through each specified column name
+for (col_name in columns_to_analyze) {
+  current_col_data <- df[[col_name]]
+
+  valid_data <- current_col_data[!is.na(current_col_data)]
+  q_vals <- quantile(valid_data, probs = c(0.25, 0.75), na.rm = FALSE, type = 7)
+  q1_val <- q_vals[1]
+  q3_val <- q_vals[2]
+  iqr_val <- q3_val - q1_val
+
+  lower_bound <- q1_val - 3 * iqr_val
+  upper_bound <- q3_val + 3 * iqr_val
+
+  is_lower_outlier <- !is.na(current_col_data) & current_col_data < lower_bound
+  is_upper_outlier <- !is.na(current_col_data) & current_col_data > upper_bound
+  is_non_outlier   <- !is.na(current_col_data) & current_col_data >= lower_bound & current_col_data <= upper_bound
+  
+  lower_outlier_values <- current_col_data[is_lower_outlier]
+  upper_outlier_values <- current_col_data[is_upper_outlier]
+
+  num_non_outliers_val <- sum(is_non_outlier)
+  
+  num_lower_outliers_val <- sum(is_lower_outlier)
+  percent_lower_outliers_val <- if (total_rows_in_df > 0) (num_lower_outliers_val / total_rows_in_df) else 0
+  
+  avg_lower_outlier_val    <- if (num_lower_outliers_val > 0) mean(lower_outlier_values) else NA_real_
+  median_lower_outlier_val <- if (num_lower_outliers_val > 0) median(lower_outlier_values) else NA_real_
+  max_lower_outlier_val    <- if (num_lower_outliers_val > 0) max(lower_outlier_values) else NA_real_ 
+
+  num_upper_outliers_val <- sum(is_upper_outlier)
+  percent_upper_outliers_val <- if (total_rows_in_df > 0) (num_upper_outliers_val / total_rows_in_df) else 0
+  
+  avg_upper_outlier_val    <- if (num_upper_outliers_val > 0) mean(upper_outlier_values) else NA_real_
+  median_upper_outlier_val <- if (num_upper_outliers_val > 0) median(upper_outlier_values) else NA_real_
+  min_upper_outlier_val    <- if (num_upper_outliers_val > 0) min(upper_outlier_values) else NA_real_
+
+  col_summary <- data.frame(
+    column_name = col_name,
+    num_non_outliers = num_non_outliers_val,
+    num_lower_outliers = num_lower_outliers_val,
+    percent_lower_outliers = percent_lower_outliers_val,
+    avg_lower_outlier_value = avg_lower_outlier_val,
+    median_lower_outlier_value = median_lower_outlier_val,
+    max_lower_outlier_value = max_lower_outlier_val,
+    num_upper_outliers = num_upper_outliers_val,
+    percent_upper_outliers = percent_upper_outliers_val,
+    avg_upper_outlier_value = avg_upper_outlier_val,
+    median_upper_outlier_value = median_upper_outlier_val,
+    min_upper_outlier_value = min_upper_outlier_val,
+    stringsAsFactors = FALSE
+  )
+  results_list[[col_name]] <- col_summary
+}
+
+outlier_summary_df <- dplyr::bind_rows(results_list)
+print(outlier_summary_df)
+```
+
+# Building multilinear regression model 
+```{r}
+set.seed(123)
+
+lm_dataset <- df %>%
+  setDT() %>%
+  select(c('pe', 'excess_close_rolling_return_1p', 'evebitda', 'grossmargin', 'ebitdamargin', 'netmargin', 'currentratio')) %>%
+  mutate_all(function(x) ifelse(is.nan(x), NA, x)) %>%
+  drop_na()
+
+lm_folds <- lm_dataset %>% vfold_cv(v=10)
+
+lm_rec <- recipe(excess_close_rolling_return_1p ~ ., data = lm_dataset) %>%
+  step_normalize(c(all_numeric_predictors())) %>%
+  step_lag()
+  step_log(c(all_numeric_predictors()), offset = 1) %>%
+  step_impute_median(all_numeric_predictors()) 
+
+lm_mod <- linear_reg()
+
+lm_wf <-
+  workflow() %>%
+  add_model(lm_mod) %>%
+  add_recipe(lm_rec)
+
+lm_fit <- lm_wf %>% fit(lm_dataset)
+fit_parsnip <- extract_fit_parsnip(lm_fit)
+fit_parsnip$fit %>% summary()
+```
+
+
+```{r}
+lgb_dataset <- df %>%
+  setDT() %>%
+  select(c('pe', 'excess_close_rolling_return_1p', 'evebitda', 'grossmargin', 'ebitdamargin', 'netmargin', 'currentratio')) %>%
+  mutate_all(function(x) ifelse(is.nan(x), NA, x)) %>%
+  drop_na()
+
+lgb_split <- initial_split(lgb_dataset, strata = excess_close_rolling_return_1p)
+lgb_train <- training(lgb_split)
+lgb_test <- testing(lgb_split)
+
+lgb_spec <- boost_tree(
+  trees = 1000,
+  tree_depth = tune(),
+  min_n = tune(),
+  mtry = tune()
+  # learn_rate = tune()
+) %>%
+  set_engine("lightgbm") %>%
+  set_mode("regression")
+
+lgb_params <-
+  dials::parameters(
+  # The parameters have sane defaults, but if you have some knowledge 
+  # of the process you can set upper and lower limits to these parameters.
+  min_n(), # 2nd important
+  tree_depth(), # 3rd most important
+  mtry()
+)
+
+lgb_grid <-
+  dials::grid_max_entropy(
+  lgb_params,
+  size = 50
+)
+
+lgb_folds <- lgb_dataset %>% vfold_cv(v=10, strata = excess_close_rolling_return_1p)
+
+lgb_rec <- recipe(excess_close_rolling_return_1p ~ ., data = lgb_dataset)
+
+lgb_wf <- workflow() %>%
+  add_recipe(lgb_rec) %>%
+  add_model(lgb_spec)
+
+lgb_res <- tune_grid(
+  lgb_wf,
+  resamples = lgb_folds,
+  grid = lgb_grid,
+  metrics = yardstick::metric_set(rmse, rsq, mae),
+  control = control_grid(save_pred = TRUE, verbose = TRUE)
+)
+
+saveRDS(lgb_res, file = "lgb_res_saved_2.rds")
+```
+
+```{r}
+lgb_res <- readRDS(file = "lgb_res_saved.rds")
+lgb_res %>% show_best(metric = "rmse", n=5)
+```
+
+```{r}
+lgb_best_params <-
+  lgb_res %>%
+  tune::select_best(metric = "rmse")
+```
+
+```{r}
+lgb_final <-
+  lgb_spec%>%
+  finalize_model(lgb_best_params)
+```
+
+```{r}
+lgb_final %>% fit(X, y)
+```
+

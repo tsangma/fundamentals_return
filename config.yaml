@@ -1,0 +1,52 @@
+dataframes:
+  equity_prices:
+    columns:
+      - 'ticker'
+      - 'date'
+      - 'close'
+      - 'volume'
+  
+  fund_prices:
+    columns:
+      - 'ticker'
+      - 'date'
+      - 'close'
+      - 'volume'
+
+  daily_metrics:
+    columns:
+      - 'ticker'
+      - 'date'
+      - 'ev'
+      - 'marketcap'
+      - 'pe'
+      - 'evebitda'
+      - 'pb'
+      - 'ps'
+
+  fundamentals:
+    columns:
+      - 'ticker'
+      - 'dimension'
+      - 'datekey'
+      - 'revenue'
+      - 'cor'
+      - 'netinc'
+      - 'capex'
+      - 'assets'
+      - 'liabilities'
+      - 'equity'
+      - 'debt'
+      - 'ebitda'
+      - 'roe'
+      - 'roa'
+      - 'roic'
+      - 'gp'
+      - 'opinc'
+      - 'grossmargin'
+      - 'ebitdamargin'
+      - 'netmargin'
+      - 'assetturnover'
+      - 'currentratio'
+      - 'workingcapital'
+      - 'depamor'
